@@ -80,8 +80,6 @@ func (p *brokerProxy) stop() {
 	p.conns = nil
 }
 
-func (p *brokerProxy) url() string { return "amqp://guest:guest@" + p.addr + "/" }
-
 func testBroker(t *testing.T) (target string, admin *amqp.Channel) {
 	t.Helper()
 	raw := os.Getenv("RABBITMQ_TEST_URL")
