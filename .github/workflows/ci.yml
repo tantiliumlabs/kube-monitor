@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GITOPS_REPO: ochestra-tech/gitops-iac
+  GITOPS_REPO: tantiliumlabs/gitops-iac
   GITOPS_BASE_BRANCH: main
   GITOPS_DEPLOYMENT_PATH: fluxcd/apps/k8-monitor/base/deployment.yaml
   GITOPS_CONTAINER_NAME: kube-monitor
@@ -125,7 +125,7 @@ jobs:
 
       - name: Set image tag
         if: steps.token-check.outputs.available == 'true'
-        run: echo "IMAGE_WITH_TAG=ghcr.io/ochestra-tech/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}" >> $GITHUB_ENV
+        run: echo "IMAGE_WITH_TAG=ghcr.io/tantiliumlabs/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}" >> $GITHUB_ENV
 
       - name: Update Deployment image
         if: steps.token-check.outputs.available == 'true'
@@ -146,7 +146,7 @@ jobs:
           title: "chore(k8s-monitor): deploy sha-${{ steps.vars.outputs.sha_short }}"
           commit-message: "chore(k8s-monitor): bump image to sha-${{ steps.vars.outputs.sha_short }}"
           body: |
-            Updates k8-monitor image to `ghcr.io/ochestra-tech/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}`.
+            Updates k8-monitor image to `ghcr.io/tantiliumlabs/kube-monitor:sha-${{ steps.vars.outputs.sha_short }}`.
 
       - name: GitOps update skipped
         if: steps.token-check.outputs.available != 'true'

@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS k8s_monitor.metric_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_metric_snapshots_cluster_time
     ON k8s_monitor.metric_snapshots (cluster_id, captured_at DESC);
+
+ALTER TABLE k8s_monitor.metric_snapshots ADD COLUMN IF NOT EXISTS mem_used_bytes BIGINT;
+ALTER TABLE k8s_monitor.metric_snapshots ADD COLUMN IF NOT EXISTS mem_allocatable_bytes BIGINT;
 `
 
 // Store is a Postgres-backed implementation of store.TimeSeriesStore.
@@ -70,14 +73,16 @@ func (s *Store) Append(ctx context.Context, pt store.MetricPoint) error {
 	const q = `
 INSERT INTO k8s_monitor.metric_snapshots
     (cluster_id, captured_at, health_score, cpu_usage_pct, mem_usage_pct,
-     ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
+     ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms,
+     mem_used_bytes, mem_allocatable_bytes)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
 	_, err := s.db.ExecContext(ctx, q,
 		pt.ClusterID, pt.Timestamp,
 		pt.HealthScore, pt.CPUUsagePct, pt.MemoryUsagePct,
 		pt.ReadyNodeCount, pt.TotalNodeCount,
 		pt.TotalPodCount, pt.FailedPodCount, pt.CrashLoopCount,
 		pt.APIServerLatencyMs,
+		pt.MemoryUsedBytes, pt.MemoryAllocatableBytes,
 	)
 	return err
 }
@@ -90,7 +95,8 @@ func (s *Store) Latest(ctx context.Context, clusterID string, n int) ([]store.Me
 	}
 	const q = `
 SELECT cluster_id, captured_at, health_score, cpu_usage_pct, mem_usage_pct,
-       ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms
+       ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms,
+       COALESCE(mem_used_bytes, 0), COALESCE(mem_allocatable_bytes, 0)
 FROM (
     SELECT * FROM k8s_monitor.metric_snapshots
     WHERE cluster_id = $1
@@ -110,7 +116,8 @@ ORDER BY captured_at ASC`
 func (s *Store) QueryRange(ctx context.Context, clusterID string, start, end time.Time) ([]store.MetricPoint, error) {
 	const q = `
 SELECT cluster_id, captured_at, health_score, cpu_usage_pct, mem_usage_pct,
-       ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms
+       ready_nodes, total_nodes, total_pods, failed_pods, crash_loops, apiserver_ms,
+       COALESCE(mem_used_bytes, 0), COALESCE(mem_allocatable_bytes, 0)
 FROM k8s_monitor.metric_snapshots
 WHERE cluster_id = $1 AND captured_at >= $2 AND captured_at <= $3
 ORDER BY captured_at ASC`
@@ -132,6 +139,7 @@ func scanRows(rows *sql.Rows) ([]store.MetricPoint, error) {
 			&pt.ReadyNodeCount, &pt.TotalNodeCount,
 			&pt.TotalPodCount, &pt.FailedPodCount, &pt.CrashLoopCount,
 			&pt.APIServerLatencyMs,
+			&pt.MemoryUsedBytes, &pt.MemoryAllocatableBytes,
 		); err != nil {
 			return nil, err
 		}
