@@ -104,6 +104,9 @@ func (s *Service) Resolve(ctx context.Context, cfg domain.Config) (map[string]co
 	return nil, fmt.Errorf("pricing resolution failed: %w", lastErr)
 }
 
+// staticSourceName is the static provider's Name().
+const staticSourceName = "static"
+
 func mergeDefaults(defaults domain.ResourcePricing, prices []domain.InstancePricing, regionMultipliers map[string]float64) map[string]cost.ResourcePricing {
 	result := make(map[string]cost.ResourcePricing)
 	for _, item := range prices {
@@ -111,7 +114,12 @@ func mergeDefaults(defaults domain.ResourcePricing, prices []domain.InstancePric
 		if pricing.CPU == 0 && pricing.Memory == 0 && pricing.Storage == 0 && pricing.Network == 0 && pricing.TotalPerHour == 0 {
 			pricing = defaults
 		}
-		pricing = applyRegionMultiplier(pricing, item.Region, regionMultipliers)
+		// Only static prices need adjusting for region. A provider's price is
+		// already that region's, so multiplying again overstated it (t3.medium
+		// in eu-north-1 was shown at $0.0467 against AWS's $0.0432).
+		if item.Source == "" || item.Source == staticSourceName {
+			pricing = applyRegionMultiplier(pricing, item.Region, regionMultipliers)
+		}
 		pricing = splitTotalIfNeeded(pricing, defaults)
 		result[item.InstanceType] = cost.ResourcePricing{
 			CPU:          pricing.CPU,

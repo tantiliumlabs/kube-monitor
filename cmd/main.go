@@ -174,6 +174,7 @@ func main() {
 	// ── Time-series store + anomaly detection ──────────────────────────────────
 	// Default: in-memory ring buffer. Opt-in to Postgres when DATABASE_URL is set.
 	var tsStore storeport.TimeSeriesStore = storeimpl.NewRingBuffer(config.RingBufferCapacity)
+	var pgStore *pgstore.Store
 	if config.DatabaseURL != "" {
 		pg, err := pgstore.New(config.DatabaseURL)
 		if err != nil {
@@ -182,6 +183,7 @@ func main() {
 			log.Printf("[store] using postgres time-series store")
 			defer pg.Close()
 			tsStore = pg
+			pgStore = pg
 		}
 	}
 	detector := anomaly.NewDetector(config.AnomalyZThreshold, config.AnomalyWindowSize)
@@ -203,7 +205,12 @@ func main() {
 		return
 	}
 
-	metricsServer := startMetricsServer(config, clientset, metricsClient, pricing, tsStore)
+	billing := newBillingAPI(ctx, clientset, pgStore)
+	if billing != nil {
+		go billing.run(ctx)
+	}
+
+	metricsServer := startMetricsServer(config, clientset, metricsClient, pricing, tsStore, billing)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 		defer cancel()
@@ -345,6 +352,7 @@ func startMetricsServer(
 	metricsClient *metricsv.Clientset,
 	pricing map[string]cost.ResourcePricing,
 	tsStore storeport.TimeSeriesStore,
+	billing *billingAPI,
 ) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -354,6 +362,8 @@ func startMetricsServer(
 	mux.Handle("/api/combined", withCORS(reportHandler("combined", clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/optimizer", withCORS(optimizerHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
 	mux.Handle("/api/cost/namespace", withCORS(namespaceCostHandler(clientset, metricsClient, pricing, config.RequestTimeout)))
+	mux.Handle("/api/cost/actual", withCORS(billing.actualHandler()))
+	mux.Handle("/api/cost/run-rate", withCORS(billing.runRateHandler()))
 	mux.Handle("/api/health/namespace", withCORS(namespaceHealthHandler(clientset, metricsClient, config.RequestTimeout)))
 	mux.Handle("/api/history", withCORS(historyHandler(tsStore, config.ClusterID, config.RequestTimeout)))
 	mux.Handle("/api/anomalies", withCORS(anomaliesHandler(tsStore, config.ClusterID, config.AnomalyWindowSize, config.AnomalyZThreshold, config.RequestTimeout)))
