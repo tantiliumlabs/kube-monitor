@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -23,12 +22,11 @@ const (
 // Publisher sends anomaly events to a RabbitMQ topic exchange.
 // All fields are safe to use after construction via NewPublisher.
 type Publisher struct {
-	conn     *amqp.Connection
-	ch       *amqp.Channel
-	exchange string
+	link *publisherLink
 }
 
-// NewPublisher dials RABBITMQ_URL and declares the exchange.
+// NewPublisher prepares the publisher and tries to connect. A broker that's down
+// isn't fatal: each publish tries to reconnect, and events are logged until then.
 // Returns nil (not an error) when RABBITMQ_URL is unset — callers must check for nil
 // before calling Publish.
 func NewPublisher() *Publisher {
@@ -40,40 +38,7 @@ func NewPublisher() *Publisher {
 	if exchange == "" {
 		exchange = defaultExchange
 	}
-
-	conn, err := amqp.DialConfig(url, amqp.Config{
-		Heartbeat: 10 * time.Second,
-		Locale:    "en_US",
-	})
-	if err != nil {
-		log.Printf("[anomaly publisher] WARN: could not connect to RabbitMQ (%v) — anomaly events will be logged only", err)
-		return nil
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Printf("[anomaly publisher] WARN: could not open channel (%v) — anomaly events will be logged only", err)
-		_ = conn.Close()
-		return nil
-	}
-
-	if err := ch.ExchangeDeclare(
-		exchange,
-		"topic",
-		true,  // durable
-		false, // auto-deleted
-		false, // internal
-		false, // no-wait
-		nil,
-	); err != nil {
-		log.Printf("[anomaly publisher] WARN: could not declare exchange (%v) — anomaly events will be logged only", err)
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil
-	}
-
-	log.Printf("[anomaly publisher] connected to RabbitMQ, exchange=%s", exchange)
-	return &Publisher{conn: conn, ch: ch, exchange: exchange}
+	return &Publisher{link: newPublisherLink(url, exchange)}
 }
 
 // Publish sends a slice of AnomalyEvents.  Each event is routed as
@@ -89,24 +54,18 @@ func (p *Publisher) Publish(ctx context.Context, events []anomaly.AnomalyEvent) 
 
 		routingKey := defaultRoutingKey + "." + string(ev.Severity)
 
-		if p == nil || p.ch == nil {
+		if p == nil {
 			log.Printf("[anomaly] %s cluster=%s metric=%s value=%.2f z=%.2f",
 				ev.Severity, ev.ClusterID, ev.Metric, ev.Value, ev.ZScore)
 			continue
 		}
 
-		if err := p.ch.PublishWithContext(ctx,
-			p.exchange,
-			routingKey,
-			false, // mandatory
-			false, // immediate
-			amqp.Publishing{
-				ContentType:  "application/json",
-				DeliveryMode: amqp.Persistent,
-				Timestamp:    ev.DetectedAt,
-				Body:         body,
-			},
-		); err != nil {
+		if err := p.link.publish(ctx, routingKey, amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Timestamp:    ev.DetectedAt,
+			Body:         body,
+		}); err != nil {
 			log.Printf("[anomaly publisher] publish error (routing_key=%s): %v", routingKey, err)
 		}
 	}
@@ -117,10 +76,5 @@ func (p *Publisher) Close() {
 	if p == nil {
 		return
 	}
-	if p.ch != nil {
-		_ = p.ch.Close()
-	}
-	if p.conn != nil {
-		_ = p.conn.Close()
-	}
+	p.link.close()
 }
