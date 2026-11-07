@@ -18,6 +18,9 @@ type MetricPoint struct {
 	FailedPodCount     int       `json:"failed_pod_count"`
 	CrashLoopCount     int       `json:"crash_loop_count"`
 	APIServerLatencyMs float64   `json:"apiserver_latency_ms"`
+	// Memory at capture time. Zero on points recorded before these existed.
+	MemoryUsedBytes        int64 `json:"memory_used_bytes,omitempty"`
+	MemoryAllocatableBytes int64 `json:"memory_allocatable_bytes,omitempty"`
 }
 
 // TimeSeriesStore persists and queries MetricPoint snapshots.

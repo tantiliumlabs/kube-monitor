@@ -406,6 +406,9 @@ func captureSnapshot(
 		FailedPodCount:     ch.PodStatus.FailedPods,
 		CrashLoopCount:     len(ch.PodStatus.CrashLoopingPods),
 		APIServerLatencyMs: ch.ControlPlaneStatus.APIServerLatency,
+
+		MemoryUsedBytes:        ch.ResourceUsage.ClusterMemoryUsedBytes,
+		MemoryAllocatableBytes: ch.ResourceUsage.ClusterMemoryAllocatableBytes,
 	}
 
 	if err := tsStore.Append(ctx, pt); err != nil {

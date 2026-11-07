@@ -54,6 +54,18 @@ type PodHealthStatus struct {
 	RestartingPods   int            `json:"restartingPods"`
 	PodsPerNode      map[string]int `json:"podsPerNode"`
 	CrashLoopingPods []string       `json:"crashLoopingPods"`
+	// StuckPods can't start and aren't crash-looping: unschedulable, missing
+	// a Secret, unable to pull an image. See findStuckPods.
+	StuckPods []StuckPod `json:"stuckPods"`
+}
+
+// StuckPod is a pod that has been unable to start for longer than a normal
+// rollout or node start would explain.
+type StuckPod struct {
+	Namespace string    `json:"namespace"`
+	Name      string    `json:"name"`
+	Reason    string    `json:"reason"`
+	Since     time.Time `json:"since"`
 }
 
 // ControlPlaneStatus contains control plane health information
@@ -78,13 +90,17 @@ type NetworkStatus struct {
 
 // ResourceUsageStatus contains resource usage information
 type ResourceUsageStatus struct {
-	ClusterCPUUsage     float64  `json:"clusterCPUUsage"`     // percentage
-	ClusterMemoryUsage  float64  `json:"clusterMemoryUsage"`  // percentage
-	ClusterStorageUsage float64  `json:"clusterStorageUsage"` // percentage
-	HighCPUNodes        []string `json:"highCPUNodes"`
-	HighMemoryNodes     []string `json:"highMemoryNodes"`
-	LowResourceNodes    []string `json:"lowResourceNodes"`
-	HighUsageNamespaces []string `json:"highUsageNamespaces"`
+	ClusterCPUUsage     float64 `json:"clusterCPUUsage"`     // percentage
+	ClusterMemoryUsage  float64 `json:"clusterMemoryUsage"`  // percentage
+	ClusterStorageUsage float64 `json:"clusterStorageUsage"` // percentage
+	// Memory in bytes, since the percentage's denominator changes with the
+	// number of nodes and so can't be turned back into bytes later.
+	ClusterMemoryUsedBytes        int64    `json:"clusterMemoryUsedBytes"`
+	ClusterMemoryAllocatableBytes int64    `json:"clusterMemoryAllocatableBytes"`
+	HighCPUNodes                  []string `json:"highCPUNodes"`
+	HighMemoryNodes               []string `json:"highMemoryNodes"`
+	LowResourceNodes              []string `json:"lowResourceNodes"`
+	HighUsageNamespaces           []string `json:"highUsageNamespaces"`
 }
 
 // ComponentStatus represents a cluster component's health
@@ -302,7 +318,91 @@ func checkPodHealth(ctx context.Context, clientset *kubernetes.Clientset, status
 		}
 	}
 
+	status.StuckPods = findStuckPods(pods.Items, time.Now())
+
 	return nil
+}
+
+const (
+	// stuckAfter is longer than a normal image pull, rollout or scale-up, so
+	// starting a node or deploying doesn't report pods that are just starting.
+	stuckAfter = 10 * time.Minute
+	// stuckPodPenalty and stuckPodMaxPenalty are in health score points.
+	stuckPodPenalty    = 2.5
+	stuckPodMaxPenalty = 25.0
+	// stuckPodsNamedInIssue keeps the issue message readable.
+	stuckPodsNamedInIssue = 5
+)
+
+// Waiting reasons that won't resolve by waiting. CrashLoopBackOff isn't here
+// because it's reported on its own.
+var stuckWaitingReasons = map[string]bool{
+	"CreateContainerConfigError": true,
+	"CreateContainerError":       true,
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"InvalidImageName":           true,
+	"RunContainerError":          true,
+}
+
+// findStuckPods returns pods older than stuckAfter that can't start: a
+// container or init container is waiting on a fault, or the pod is still
+// Pending. Pods being deleted or that have finished are left out.
+func findStuckPods(pods []v1.Pod, now time.Time) []StuckPod {
+	stuck := make([]StuckPod, 0)
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+			continue
+		}
+		if now.Sub(pod.CreationTimestamp.Time) < stuckAfter {
+			continue
+		}
+		if reason := stuckReason(pod); reason != "" {
+			stuck = append(stuck, StuckPod{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+				Reason:    reason,
+				Since:     pod.CreationTimestamp.Time,
+			})
+		}
+	}
+	return stuck
+}
+
+func stuckReason(pod *v1.Pod) string {
+	for _, statuses := range [][]v1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for _, cs := range statuses {
+			if cs.State.Waiting != nil && stuckWaitingReasons[cs.State.Waiting.Reason] {
+				return cs.State.Waiting.Reason
+			}
+		}
+	}
+	if pod.Status.Phase != v1.PodPending {
+		return ""
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == v1.PodScheduled && c.Status == v1.ConditionFalse && c.Reason != "" {
+			return c.Reason
+		}
+	}
+	return "Pending"
+}
+
+// stuckPodsMessage names the first few stuck pods, so the issue says what to look at.
+func stuckPodsMessage(pods []StuckPod) string {
+	named := make([]string, 0, stuckPodsNamedInIssue)
+	for i, p := range pods {
+		if i == stuckPodsNamedInIssue {
+			break
+		}
+		named = append(named, fmt.Sprintf("%s/%s (%s)", p.Namespace, p.Name, p.Reason))
+	}
+	msg := fmt.Sprintf("%d pods can't start: %s", len(pods), strings.Join(named, ", "))
+	if extra := len(pods) - len(named); extra > 0 {
+		msg += fmt.Sprintf(", and %d more", extra)
+	}
+	return msg
 }
 
 // checkControlPlaneHealth checks the health of control plane components
@@ -518,6 +618,8 @@ func checkResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, me
 	}
 	if totalMemoryCapacityBytes > 0 {
 		status.ClusterMemoryUsage = float64(totalMemoryUsageBytes) / float64(totalMemoryCapacityBytes) * 100.0
+		status.ClusterMemoryUsedBytes = totalMemoryUsageBytes
+		status.ClusterMemoryAllocatableBytes = totalMemoryCapacityBytes
 	}
 
 	// ClusterStorageUsage and HighUsageNamespaces require additional metrics (e.g., CSI or volume usage) or pod metrics by namespace;
@@ -798,6 +900,15 @@ func identifyHealthIssues(h *ClusterHealth) {
 			Suggestion: "Check container logs and recent changes; consider backoff, probe configuration, or image issues.",
 		})
 	}
+	if len(h.PodStatus.StuckPods) > 0 {
+		issues = append(issues, HealthIssue{
+			Severity:   "warning",
+			Resource:   "pods",
+			Message:    stuckPodsMessage(h.PodStatus.StuckPods),
+			Timestamp:  now,
+			Suggestion: "Describe each pod for its events: a missing Secret or ConfigMap, an image that can't be pulled, or no node with room or a matching selector. These don't resolve by waiting.",
+		})
+	}
 	if h.PodStatus.RestartingPods > 10 {
 		issues = append(issues, HealthIssue{
 			Severity:   "warning",
@@ -899,6 +1010,7 @@ func calculateHealthScore(h *ClusterHealth) int {
 	// Pods: failed, crashlooping and frequent restarts
 	score -= float64(h.PodStatus.FailedPods) * 2.0
 	score -= float64(len(h.PodStatus.CrashLoopingPods)) * 2.5
+	score -= math.Min(float64(len(h.PodStatus.StuckPods))*stuckPodPenalty, stuckPodMaxPenalty)
 	if h.PodStatus.RestartingPods > 10 {
 		score -= 5.0
 	}
